@@ -1,6 +1,8 @@
 """
 Dataset loader và hàm tạo Gaussian Heatmap cho bài toán nhận diện quả cầu lông.
-Sử dụng cơ chế Lazy Loading (chỉ nạp 3 frame cần thiết vào RAM khi được gọi).
+Hỗ trợ cả 2 chế độ:
+1. Đọc trực tiếp từ ảnh JPG đã trích xuất sẵn trong 'Dataset_frames/' (CỰC NHANH, khuyến nghị cho Colab/GPU).
+2. Tự động fallback đọc từ file '.mp4' nếu chưa trích xuất ảnh.
 """
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -18,17 +20,10 @@ def generate_gaussian_heatmap(
     center_y: float,
     sigma: float = 2.5
 ) -> np.ndarray:
-    """
-    Tạo bản đồ nhiệt Gaussian 2D tại vị trí (center_x, center_y).
-    - Tâm tại vị trí quả cầu có giá trị cực đại = 1.0.
-    - Lan tỏa mờ dần về 0.0 theo bán kính 3 * sigma.
-    - Trả về ma trận numpy kích thước (height, width).
-    """
-    # Nếu tọa độ nằm ngoài biên ảnh, trả về ma trận toàn số 0.0
+    """Tạo bản đồ nhiệt Gaussian 2D tại vị trí (center_x, center_y)."""
     if center_x < 0 or center_x >= width or center_y < 0 or center_y >= height:
         return np.zeros((height, width), dtype=np.float32)
 
-    # Giới hạn vùng tính toán trong hộp bán kính 3*sigma để tối ưu CPU
     radius = int(np.ceil(3 * sigma))
     x0 = max(0, int(center_x - radius))
     x1 = min(width, int(center_x + radius + 1))
@@ -39,7 +34,6 @@ def generate_gaussian_heatmap(
     if x1 <= x0 or y1 <= y0:
         return heatmap
 
-    # Tính toán giá trị Gaussian theo khoảng cách Euclidean
     grid_y, grid_x = np.ogrid[y0:y1, x0:x1]
     dist_sq = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2
     gaussian = np.exp(-dist_sq / (2.0 * sigma * sigma))
@@ -49,27 +43,26 @@ def generate_gaussian_heatmap(
 
 
 class BadmintonDataset(Dataset):
-    """
-    - Khởi tạo: Chỉ lập danh mục chỉ mục (Index) từ các file CSV (~ vài MB RAM).
-    - __getitem__: Chỉ đọc đúng 3 frame từ mp4 vào RAM khi mô hình yêu cầu một mẫu.
-    """
     def __init__(
         self,
         dataset_root: Path = Path("Dataset"),
+        frames_root: Path = Path("Dataset_frames"),
         subsets: List[str] = ("Amateur", "Professional"),
         input_width: int = 512,
         input_height: int = 288,
         sigma: float = 2.5,
-        max_samples: Optional[int] = None
+        max_samples: Optional[int] = None,
+        stride: int = 1
     ):
         super().__init__()
         self.dataset_root = Path(dataset_root)
+        self.frames_root = Path(frames_root)
         self.subsets = subsets
         self.input_width = input_width
         self.input_height = input_height
         self.sigma = sigma
+        self.stride = stride
 
-        # Danh sách metadata: Chỉ lưu đường dẫn video, số thứ tự frame và tọa độ x, y
         self.samples: List[Dict] = []
         self._index_dataset()
 
@@ -77,10 +70,6 @@ class BadmintonDataset(Dataset):
             self.samples = self.samples[:max_samples]
 
     def _index_dataset(self):
-        """
-        Quét nhanh qua các file CSV và kiểm tra video mp4 tương ứng.
-        Chỉ lưu thông tin tọa độ và đường dẫn vào RAM.
-        """
         for subset in self.subsets:
             subset_dir = self.dataset_root / subset
             if not subset_dir.exists():
@@ -108,10 +97,12 @@ class BadmintonDataset(Dataset):
                         continue
 
                     num_frames = len(df)
-                    # Tạo bộ ba frame liên tiếp (i-1, i, i+1) với bước nhảy stride=2 để dữ liệu cô đọng và chạy nhanh gấp đôi
-                    stride = 2
-                    for i in range(1, num_frames - 1, stride):
+                    # Tạo bộ ba frame liên tiếp (i-1, i, i+1) với bước nhảy stride
+                    for i in range(1, num_frames - 1, self.stride):
                         self.samples.append({
+                            "subset": subset,
+                            "match": match_dir.name,
+                            "clip_name": clip_name,
                             "video_path": str(video_path),
                             "frame_indices": (i - 1, i, i + 1),
                             "labels": [
@@ -127,31 +118,55 @@ class BadmintonDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _read_single_frame(self, cap: cv2.VideoCapture, frame_idx: int) -> Optional[np.ndarray]:
-        """Đọc đúng 1 frame chỉ định từ video mp4."""
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            return None
-        # Chuyển hệ màu OpenCV BGR sang RGB
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    def _read_frame(
+        self,
+        sample: Dict,
+        frame_idx: int,
+        cap: Optional[cv2.VideoCapture] = None
+    ) -> Optional[np.ndarray]:
+        """
+        Ưu tiên đọc từ file ảnh JPG (siêu nhanh: ~0.001s).
+        Nếu chưa trích xuất ảnh, tự động fallback đọc từ VideoCapture.
+        """
+        subset = sample["subset"]
+        match_name = sample["match"]
+        clip_name = sample["clip_name"]
+
+        # 1. Kiểm tra ảnh đã trích xuất trong Dataset_frames/
+        img_path = self.frames_root / subset / match_name / clip_name / f"{frame_idx:04d}.jpg"
+        if img_path.exists():
+            img_bgr = cv2.imread(str(img_path))
+            if img_bgr is not None:
+                return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        # 2. Fallback: Đọc từ video MP4 nếu chưa có thư mục ảnh
+        if cap is not None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if ret and frame is not None:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                return cv2.resize(frame_rgb, (self.input_width, self.input_height), interpolation=cv2.INTER_LINEAR)
+
+        return None
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        """
-        Hàm này chỉ được gọi khi mô hình cần dữ liệu:
-        1. Mở video, đọc đúng 3 frame (i-1, i, i+1).
-        2. Resize về 288x512 và chuẩn hóa về [0, 1].
-        3. Tạo 3 Heatmap nhãn từ tọa độ (X, Y).
-        4. Trả về Tensor cho batch hiện tại.
-        """
         sample = self.samples[idx]
-        video_path = sample["video_path"]
         f_indices = sample["frame_indices"]
         labels = sample["labels"]
 
-        cap = cv2.VideoCapture(video_path)
-        orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
-        orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+        # Kiểm tra xem có thư mục ảnh JPG không
+        subset = sample["subset"]
+        match_name = sample["match"]
+        clip_name = sample["clip_name"]
+        clip_frames_dir = self.frames_root / subset / match_name / clip_name
+        use_images = clip_frames_dir.exists()
+
+        cap = None
+        orig_w, orig_h = 1280, 720
+        if not use_images:
+            cap = cv2.VideoCapture(sample["video_path"])
+            orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+            orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
 
         scale_x = self.input_width / float(orig_w)
         scale_y = self.input_height / float(orig_h)
@@ -160,17 +175,13 @@ class BadmintonDataset(Dataset):
         heatmaps = []
 
         for f_idx, label in zip(f_indices, labels):
-            frame = self._read_single_frame(cap, f_idx)
+            frame = self._read_frame(sample, f_idx, cap=cap)
             if frame is None:
-                # Nếu video bị lỗi ở frame này, thay bằng khung đen
                 frame = np.zeros((self.input_height, self.input_width, 3), dtype=np.uint8)
-            else:
-                frame = cv2.resize(frame, (self.input_width, self.input_height), interpolation=cv2.INTER_LINEAR)
 
-            # Chuẩn hóa giá trị pixel về [0.0, 1.0]
             resized_frames.append(frame.astype(np.float32) / 255.0)
 
-            # Sinh Gaussian Heatmap nhãn
+            # Tạo Heatmap nhãn
             if label["vis"] == 1 and label["x"] > 0 and label["y"] > 0:
                 cx = label["x"] * scale_x
                 cy = label["y"] * scale_y
@@ -182,23 +193,19 @@ class BadmintonDataset(Dataset):
                     sigma=self.sigma
                 )
             else:
-                # Quả cầu bị khuất hoặc ngoài sân -> ma trận toàn 0
                 hm = np.zeros((self.input_height, self.input_width), dtype=np.float32)
 
             heatmaps.append(hm)
 
-        # Đóng video ngay sau khi lấy xong 3 frame để giải phóng file descriptor
-        cap.release()
+        if cap is not None:
+            cap.release()
 
-        # Ghép 3 frames theo trục kênh: (288, 512, 3) x 3 -> (288, 512, 9) -> (9, 288, 512)
         frames_concat = np.concatenate(resized_frames, axis=2)
         frames_tensor = torch.from_numpy(frames_concat).permute(2, 0, 1).float()
-
-        # Xếp 3 heatmaps: (3, 288, 512)
         heatmaps_tensor = torch.from_numpy(np.stack(heatmaps, axis=0)).float()
 
         metadata = {
-            "video_path": video_path,
+            "video_path": sample["video_path"],
             "center_frame": f_indices[1],
             "orig_size": (orig_w, orig_h),
             "labels": labels
@@ -208,22 +215,10 @@ class BadmintonDataset(Dataset):
 
 
 if __name__ == "__main__":
-    # Test thử trực tiếp trên dữ liệu thật
     print("Testing BadmintonDataset...")
-    dataset = BadmintonDataset(
-        dataset_root=Path("Dataset"),
-        subsets=["Amateur"],
-        input_width=512,
-        input_height=288,
-        sigma=2.5,
-        max_samples=10  # Chỉ test 10 mẫu đầu tiên
-    )
-    print(f"Tổng số mẫu tìm thấy trong chỉ mục: {len(dataset)}")
-    
-    if len(dataset) > 0:
-        frames, heatmaps, meta = dataset[0]
-        print(f"Frames Tensor Shape:   {frames.shape}  (Kỳ vọng: [9, 288, 512])")
-        print(f"Heatmaps Tensor Shape: {heatmaps.shape} (Kỳ vọng: [3, 288, 512])")
-        print(f"Dải giá trị Frames:   min={frames.min():.2f}, max={frames.max():.2f}")
-        print(f"Dải giá trị Heatmaps: min={heatmaps.min():.2f}, max={heatmaps.max():.2f}")
-        print("Xác thực Dataset thành công!")
+    ds = BadmintonDataset(max_samples=10)
+    print(f"Total samples: {len(ds)}")
+    if len(ds) > 0:
+        f, h, m = ds[0]
+        print(f"Frames: {f.shape}, Heatmaps: {h.shape}")
+        print("Dataset ready!")

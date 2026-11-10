@@ -1,7 +1,10 @@
 .venv
 .vscode
 Dataset
+Dataset_frames
 weights
 checkpoints
+*.rar
+*.zip
 __pycache__
 *.pyc
