@@ -211,18 +211,21 @@ def main():
         print("Lỗi: Không tìm thấy dữ liệu! Hãy kiểm tra lại thư mục Dataset.")
         return
 
+    # Tự động dùng 2 luồng đọc dữ liệu nền trên GPU/Linux để tăng tốc tối đa
+    num_workers = 2 if device.type == "cuda" else 0
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=0,  # 0 để an toàn và tương thích tối đa trên Windows
+        num_workers=num_workers,
         pin_memory=(device.type == "cuda")
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=(device.type == "cuda")
     )
 

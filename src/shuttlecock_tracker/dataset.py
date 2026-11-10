@@ -108,8 +108,9 @@ class BadmintonDataset(Dataset):
                         continue
 
                     num_frames = len(df)
-                    # Tạo bộ ba frame liên tiếp (i-1, i, i+1)
-                    for i in range(1, num_frames - 1):
+                    # Tạo bộ ba frame liên tiếp (i-1, i, i+1) với bước nhảy stride=2 để dữ liệu cô đọng và chạy nhanh gấp đôi
+                    stride = 2
+                    for i in range(1, num_frames - 1, stride):
                         self.samples.append({
                             "video_path": str(video_path),
                             "frame_indices": (i - 1, i, i + 1),
