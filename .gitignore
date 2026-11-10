@@ -1,2 +1,7 @@
-Dataset
 .venv
+.vscode
+Dataset
+weights
+checkpoints
+__pycache__
+*.pyc

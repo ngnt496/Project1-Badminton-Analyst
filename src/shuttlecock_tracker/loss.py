@@ -85,7 +85,7 @@ class ModifiedFocalLoss(nn.Module):
         return (pos_loss.sum() + neg_loss.sum()) / num_pos
 
 
-def get_loss_fn(loss_name: str = "weighted_bce", pos_weight: float = 100.0) -> nn.Module:
+def get_loss_fn(loss_name: str = "focal", pos_weight: float = 100.0) -> nn.Module:
     """
     Hàm khởi tạo Loss Function tiện lợi.
     """
