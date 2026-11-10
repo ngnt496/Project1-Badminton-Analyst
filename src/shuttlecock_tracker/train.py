@@ -36,9 +36,11 @@ MAX_VAL_SAMPLES = 10
 NUM_EPOCHS = 1 if TEST_MODE else 30
 BATCH_SIZE = 2
 LEARNING_RATE = 1e-3        # Tốc độ học khởi điểm của Optimizer
-POS_WEIGHT = 100.0          # Trọng số phạt vùng quả cầu trong BCE Loss
+LOSS_TYPE = "focal"         # "focal": Modified Focal Loss (CenterNet style) | "weighted_bce"
+POS_WEIGHT = 100.0          # Trọng số phạt dự phòng nếu chọn weighted_bce
 
 DATA_DIR = "Dataset"
+FRAMES_DIR = "Dataset_frames"  # Thư mục chứa các ảnh JPG đã trích xuất siêu tốc
 WEIGHTS_DIR = "weights"
 BEST_WEIGHTS_FILE = "shuttlecock_unet.pth"
 LAST_WEIGHTS_FILE = "shuttlecock_lastmodel.pth"
@@ -186,8 +188,14 @@ def main():
 
     # 2. Khởi tạo Dataset Train và Test
     print(f"--> Đang quét tập Train (Amateur + Professional) trong '{DATA_DIR}'...")
+    if Path(FRAMES_DIR).exists():
+        print(f"    [+] Tìm thấy thư mục '{FRAMES_DIR}' -> Đọc ảnh JPG")
+    else:
+        print(f"    [!] Chưa tìm thấy '{FRAMES_DIR}' -> Tự động đọc từ video MP4...")
+
     train_dataset = BadmintonDataset(
         dataset_root=Path(DATA_DIR),
+        frames_root=Path(FRAMES_DIR),
         subsets=["Amateur", "Professional"],
         input_width=512,
         input_height=288,
@@ -199,6 +207,7 @@ def main():
     print(f"--> Đang quét tập Validation (Test: match1, match2, match3)...")
     val_dataset = BadmintonDataset(
         dataset_root=Path(DATA_DIR),
+        frames_root=Path(FRAMES_DIR),
         subsets=["Test"],
         input_width=512,
         input_height=288,
@@ -231,7 +240,7 @@ def main():
 
     # 3. Khởi tạo Mô hình, Hàm Loss (criterion), Bộ tối ưu và Lịch giảm LR
     model = ShuttlecockTrackerNet(in_channels=9, out_channels=3).to(device)
-    loss_fn = get_loss_fn(loss_name="weighted_bce", pos_weight=POS_WEIGHT)
+    loss_fn = get_loss_fn(loss_name=LOSS_TYPE, pos_weight=POS_WEIGHT)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=3
@@ -256,6 +265,8 @@ def main():
     print(" BẮT ĐẦU HUẤN LUYỆN SHUTTLECOCK TRACKER")
     print(f"  + Số lượng Epochs:       {NUM_EPOCHS}")
     print(f"  + Kích thước Batch Size: {BATCH_SIZE}")
+    print(f"  + Tốc độ học (LR):       {LEARNING_RATE}")
+    print(f"  + Hàm mất mát (Loss):    {LOSS_TYPE} (Modified Focal Loss)")
     print(f"  + File lưu tốt nhất:     {best_weights_path}")
     print(f"  + File lưu gần nhất:     {last_weights_path}")
     print("=" * 65)

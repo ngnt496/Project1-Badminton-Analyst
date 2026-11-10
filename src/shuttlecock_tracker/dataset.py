@@ -84,7 +84,10 @@ class BadmintonDataset(Dataset):
                 for csv_path in sorted(csv_dir.glob("*_ball.csv")):
                     clip_name = csv_path.stem.replace("_ball", "")
                     video_path = video_dir / f"{clip_name}.mp4"
-                    if not video_path.exists():
+                    clip_frames_dir = self.frames_root / subset / match_dir.name / clip_name
+
+                    # Hợp lệ nếu có thư mục ảnh JPG hoặc có file video MP4
+                    if not clip_frames_dir.exists() and not video_path.exists():
                         continue
 
                     try:
