@@ -1,5 +1,5 @@
 """
-Huấn luyện mô hình ShuttlecockTrackerNet.
+Huấn luyện mô hình ShuttlecockTrackerNet (Tối ưu hóa tốc độ cao với AMP FP16 & Stride).
     python src/shuttlecock_tracker/train.py
 hoặc:
     python -m src.shuttlecock_tracker.train
@@ -15,7 +15,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Tự động nhận diện thư mục gốc của dự án để chạy lệnh ở bất kỳ đâu cũng không bị lỗi import
+# Tự động nhận diện thư mục gốc của dự án
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -28,13 +28,16 @@ from src.shuttlecock_tracker.model import ShuttlecockTrackerNet
 # ==============================================================================
 # CẤU HÌNH THAM SỐ
 # ==============================================================================
-# Bật chế độ TEST_MODE để chạy thử
-TEST_MODE = True            # Đổi False khi training
+TEST_MODE = True            # Đổi False khi chạy huấn luyện thật trên Colab
 MAX_TRAIN_SAMPLES = 20
 MAX_VAL_SAMPLES = 10
 
 NUM_EPOCHS = 1 if TEST_MODE else 30
-BATCH_SIZE = 2
+BATCH_SIZE = 2 if TEST_MODE else 16   # Nhờ bật AMP (FP16) giảm 50% VRAM, GPU T4 chạy mượt Batch 16
+TRAIN_STRIDE = 2            # Bước nhảy mẫu = 2 (cô đọng từ 78,214 -> 39,107 mẫu, nhanh gấp đôi)
+VAL_STRIDE = 2              # Bước nhảy tập Test = 2
+USE_AMP = True              # Bật Mixed Precision (FP16 Tensor Cores) trên GPU giúp tăng tốc 2-3x
+
 LEARNING_RATE = 1e-3        # Tốc độ học khởi điểm của Optimizer
 LOSS_TYPE = "focal"         # "focal": Modified Focal Loss (CenterNet style) | "weighted_bce"
 POS_WEIGHT = 100.0          # Trọng số phạt dự phòng nếu chọn weighted_bce
@@ -51,12 +54,13 @@ RESUME_CHECKPOINT = None
 
 
 def set_seed(seed: int = 42):
-    """Cố định seed ngẫu nhiên để kết quả ổn định qua các lần chạy."""
+    """Cố định seed ngẫu nhiên và bật tối ưu hóa cuDNN cho kích thước ảnh cố định."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
 
 
 def extract_coords_from_heatmap(
@@ -77,23 +81,34 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     loss_fn: nn.Module,
     device: torch.device,
-    epoch: int
+    epoch: int,
+    scaler: torch.amp.GradScaler,
+    amp_enabled: bool
 ) -> float:
-    """Vòng lặp huấn luyện trong 1 Epoch."""
-    model.train()  # Bật chế độ huấn luyện
+    """Vòng lặp huấn luyện trong 1 Epoch có tích hợp AMP (FP16)."""
+    model.train()
     total_loss = 0.0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch:02d} [Train]", leave=False)
     for frames, heatmaps, _ in pbar:
-        frames = frames.to(device)
-        heatmaps = heatmaps.to(device)
+        frames = frames.to(device, non_blocking=True)
+        heatmaps = heatmaps.to(device, non_blocking=True)
 
-        optimizer.zero_grad()                         # 1. Xóa gradient cũ
-        logits = model(frames, return_logits=True)     # 2. Dự đoán logits thô
-        loss = loss_fn(logits, heatmaps)               # 3. Tính hàm mất mát có trọng số
-        loss.backward()                                # 4. Lan truyền ngược tính gradient
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # 5. Cắt tỉa gradient
-        optimizer.step()                               # 6. Cập nhật trọng số
+        optimizer.zero_grad(set_to_none=True)
+
+        # 1. Forward pass với Mixed Precision (FP16) trên Tensor Cores
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            logits = model(frames, return_logits=True)
+
+        # 2. Tính hàm mất mát ở chuẩn FP32 để đảm bảo độ chính xác số học tuyệt đối
+        loss = loss_fn(logits.float(), heatmaps.float())
+
+        # 3. Backward & Cập nhật trọng số qua GradScaler
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -107,34 +122,34 @@ def validate(
     dataloader: DataLoader,
     loss_fn: nn.Module,
     device: torch.device,
+    amp_enabled: bool,
     input_w: int = 512,
     input_h: int = 288,
     dist_tolerance: float = 5.0
 ) -> Dict[str, float]:
     """Vòng lặp đánh giá trên tập Test."""
-    model.eval()  # Chuyển sang chế độ đánh giá
+    model.eval()
     total_loss = 0.0
     tp, fp, fn = 0, 0, 0
 
     pbar = tqdm(dataloader, desc="[Validating on Test set]", leave=False)
     for frames, heatmaps, metadata in pbar:
-        frames = frames.to(device)
-        heatmaps = heatmaps.to(device)
+        frames = frames.to(device, non_blocking=True)
+        heatmaps = heatmaps.to(device, non_blocking=True)
 
-        logits = model(frames, return_logits=True)
-        loss = loss_fn(logits, heatmaps)
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+            logits = model(frames, return_logits=True)
+
+        loss = loss_fn(logits.float(), heatmaps.float())
         total_loss += loss.item()
 
-        # Chuyển logits sang xác suất [0.0, 1.0] bằng Sigmoid
-        probs = torch.sigmoid(logits).cpu().numpy()
+        probs = torch.sigmoid(logits.float()).cpu().numpy()
 
         batch_size = frames.size(0)
         for b in range(batch_size):
-            # Lấy heatmap của frame giữa (frame t, index channel = 1)
             pred_hm = probs[b, 1]
             vis_pred, px, py = extract_coords_from_heatmap(pred_hm, threshold=0.5)
 
-            # Lấy nhãn ground truth của frame giữa
             gt_center = metadata["labels"][1]
             vis_gt = int(gt_center["vis"][b])
             gt_x = float(gt_center["x"][b])
@@ -143,7 +158,6 @@ def validate(
             orig_w = float(metadata["orig_size"][0][b]) or 1280.0
             orig_h = float(metadata["orig_size"][1][b]) or 720.0
 
-            # Quy đổi tọa độ dự đoán về kích thước video gốc
             scaled_pred_x = px * (orig_w / float(input_w))
             scaled_pred_y = py * (orig_h / float(input_h))
 
@@ -176,7 +190,9 @@ def validate(
 def main():
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n--> Thiết bị tính toán được sử dụng: {device}")
+    amp_enabled = USE_AMP and (device.type == "cuda")
+
+    print(f"\n--> Thiết bị tính toán: {device} | Mixed Precision (AMP FP16): {amp_enabled}")
     if TEST_MODE:
         print("--> [CHẾ ĐỘ TEST NHANH]: Bật giới hạn mẫu để chạy mượt trên CPU yếu.")
 
@@ -186,10 +202,10 @@ def main():
     best_weights_path = weights_path / BEST_WEIGHTS_FILE
     last_weights_path = weights_path / LAST_WEIGHTS_FILE
 
-    # 2. Khởi tạo Dataset Train và Test
-    print(f"--> Đang quét tập Train (Amateur + Professional) trong '{DATA_DIR}'...")
+    # 2. Khởi tạo Dataset Train và Test (có áp dụng bước nhảy Stride)
+    print(f"--> Đang quét tập Train (Amateur + Professional) trong '{DATA_DIR}' (stride={TRAIN_STRIDE})...")
     if Path(FRAMES_DIR).exists():
-        print(f"    [+] Tìm thấy thư mục '{FRAMES_DIR}' -> Đọc ảnh JPG")
+        print(f"    [+] Tìm thấy thư mục '{FRAMES_DIR}' -> Đọc ảnh JPG siêu tốc!")
     else:
         print(f"    [!] Chưa tìm thấy '{FRAMES_DIR}' -> Tự động đọc từ video MP4...")
 
@@ -200,11 +216,12 @@ def main():
         input_width=512,
         input_height=288,
         sigma=2.5,
-        max_samples=MAX_TRAIN_SAMPLES if TEST_MODE else None
+        max_samples=MAX_TRAIN_SAMPLES if TEST_MODE else None,
+        stride=1 if TEST_MODE else TRAIN_STRIDE
     )
     print(f"    [+] Số mẫu nạp vào tập Train: {len(train_dataset)}")
 
-    print(f"--> Đang quét tập Validation (Test: match1, match2, match3)...")
+    print(f"--> Đang quét tập Validation (Test: match1, match2, match3) (stride={VAL_STRIDE})...")
     val_dataset = BadmintonDataset(
         dataset_root=Path(DATA_DIR),
         frames_root=Path(FRAMES_DIR),
@@ -212,7 +229,8 @@ def main():
         input_width=512,
         input_height=288,
         sigma=2.5,
-        max_samples=MAX_VAL_SAMPLES if TEST_MODE else None
+        max_samples=MAX_VAL_SAMPLES if TEST_MODE else None,
+        stride=1 if TEST_MODE else VAL_STRIDE
     )
     print(f"    [+] Số mẫu nạp vào tập Validation: {len(val_dataset)}")
 
@@ -220,7 +238,6 @@ def main():
         print("Lỗi: Không tìm thấy dữ liệu! Hãy kiểm tra lại thư mục Dataset.")
         return
 
-    # Tự động dùng 2 luồng đọc dữ liệu nền trên GPU/Linux để tăng tốc tối đa
     num_workers = 2 if device.type == "cuda" else 0
 
     train_loader = DataLoader(
@@ -238,10 +255,11 @@ def main():
         pin_memory=(device.type == "cuda")
     )
 
-    # 3. Khởi tạo Mô hình, Hàm Loss (criterion), Bộ tối ưu và Lịch giảm LR
+    # 3. Khởi tạo Mô hình, Hàm Loss, Bộ tối ưu, GradScaler và Scheduler
     model = ShuttlecockTrackerNet(in_channels=9, out_channels=3).to(device)
     loss_fn = get_loss_fn(loss_name=LOSS_TYPE, pos_weight=POS_WEIGHT)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_enabled)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=3
     )
@@ -264,30 +282,34 @@ def main():
     print("\n" + "=" * 65)
     print(" BẮT ĐẦU HUẤN LUYỆN SHUTTLECOCK TRACKER")
     print(f"  + Số lượng Epochs:       {NUM_EPOCHS}")
-    print(f"  + Kích thước Batch Size: {BATCH_SIZE}")
+    print(f"  + Kích thước Batch Size: {BATCH_SIZE} (Tổng số bước/epoch: {len(train_loader)})")
     print(f"  + Tốc độ học (LR):       {LEARNING_RATE}")
     print(f"  + Hàm mất mát (Loss):    {LOSS_TYPE} (Modified Focal Loss)")
+    print(f"  + Tăng tốc phần cứng:    AMP FP16={amp_enabled}, Stride={TRAIN_STRIDE}")
     print(f"  + File lưu tốt nhất:     {best_weights_path}")
     print(f"  + File lưu gần nhất:     {last_weights_path}")
     print("=" * 65)
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
-        # Huấn luyện 1 epoch
-        train_loss = train_one_epoch(model, train_loader, optimizer, loss_fn, device, epoch)
+        current_lr = optimizer.param_groups[0]["lr"]
 
-        # Đánh giá trên tập Test
-        val_metrics = validate(model, val_loader, loss_fn, device, input_w=512, input_h=288)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, loss_fn, device, epoch, scaler, amp_enabled
+        )
+
+        val_metrics = validate(
+            model, val_loader, loss_fn, device, amp_enabled, input_w=512, input_h=288
+        )
         val_loss = val_metrics["val_loss"]
         precision = val_metrics["precision"]
         recall = val_metrics["recall"]
         f1 = val_metrics["f1"]
 
-        # Cập nhật lịch học
         scheduler.step(val_loss)
 
-        # In kết quả Epoch
         print(
             f"Epoch {epoch:02d}/{NUM_EPOCHS:02d} | "
+            f"LR: {current_lr:.6f} | "
             f"Train Loss: {train_loss:.5f} | "
             f"Val Loss: {val_loss:.5f} | "
             f"Prec: {precision:.4f} | Rec: {recall:.4f} | F1: {f1:.4f}"

@@ -3,6 +3,7 @@
 Dataset
 Dataset_frames
 weights
+output
 checkpoints
 *.rar
 *.zip

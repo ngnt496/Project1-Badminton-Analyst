@@ -33,6 +33,10 @@ class WeightedBCEWithLogitsLoss(nn.Module):
         Returns:
             Giá trị loss trung bình (scalar).
         """
+        # Ép kiểu về float32 để đảm bảo an toàn tuyệt đối khi dùng AMP (FP16)
+        logits = logits.float()
+        targets = targets.float()
+
         # Chuyển logits sang xác suất trong khoảng [eps, 1 - eps] để an toàn về mặt số học
         probs = torch.sigmoid(logits)
         probs = torch.clamp(probs, min=self.eps, max=1.0 - self.eps)
@@ -63,6 +67,10 @@ class ModifiedFocalLoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Ép kiểu về float32 để tránh tràn số (underflow/NaN) khi chạy AMP (FP16)
+        logits = logits.float()
+        targets = targets.float()
+
         probs = torch.sigmoid(logits)
         probs = torch.clamp(probs, min=self.eps, max=1.0 - self.eps)
 
